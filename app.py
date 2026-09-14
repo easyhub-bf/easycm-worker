@@ -32,8 +32,8 @@ app = FastAPI(title="EasyCM Render Worker")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-# 720p : compromis qualité/mémoire adapté aux instances gratuites (512 Mo)
-RES = {"landscape": (1280, 720), "portrait": (720, 1280), "square": (720, 720)}
+# 480p : mémoire réduite pour tenir dans 512 Mo (instances gratuites)
+RES = {"landscape": (854, 480), "portrait": (480, 854), "square": (480, 480)}
 # Options x264 économes en mémoire/CPU (indispensable sur tier gratuit)
 X264 = ["-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-pix_fmt", "yuv420p"]
 OUT = Path(tempfile.gettempdir()) / "easycm_out"
@@ -94,10 +94,13 @@ async def render(body: RenderIn):
             # 2) Clip vidéo (ou fond uni si absent)
             clip_path = work / f"c{i}.mp4"
             if clip and clip.get("url"):
-                async with httpx.AsyncClient(timeout=90, follow_redirects=True) as cl:
-                    r = await cl.get(clip["url"])
-                    r.raise_for_status()
-                    clip_path.write_bytes(r.content)
+                # téléchargement en flux (n'immobilise pas 30 Mo en RAM)
+                async with httpx.AsyncClient(timeout=120, follow_redirects=True) as cl:
+                    async with cl.stream("GET", clip["url"]) as r:
+                        r.raise_for_status()
+                        with open(clip_path, "wb") as fh:
+                            async for chunk in r.aiter_bytes(65536):
+                                fh.write(chunk)
             else:
                 await _run(["ffmpeg", "-y", "-f", "lavfi", "-i",
                             f"color=c=0x141B2D:s={W}x{H}:d={dur}", "-t", str(dur), str(clip_path)])
@@ -131,8 +134,9 @@ async def render(body: RenderIn):
         listf = work / "list.txt"
         listf.write_text("".join(f"file '{p.as_posix()}'\n" for p in scene_files), encoding="utf-8")
         assembled = work / "assembled.mp4"
+        # concat SANS ré-encodage (scènes déjà encodées à l'identique) → très léger
         await _run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listf),
-                    *X264, "-c:a", "aac", "-b:a", "128k", "-ar", "44100", str(assembled)])
+                    "-c", "copy", "-movflags", "+faststart", str(assembled)])
 
         # 6) Musique de fond (option) mixée sous la voix
         final = OUT / f"{uuid.uuid4().hex}.mp4"
